@@ -1,0 +1,85 @@
+x-app-env: &app-env
+  API_KEY: ${API_KEY:-dev-secret-key}
+  DATABASE_URL: postgresql+asyncpg://payments:payments@postgres:5432/payments
+  RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+  WEBHOOK_SECRET: ${WEBHOOK_SECRET:-dev-webhook-secret}
+  GATEWAY_DELAY_MIN: ${GATEWAY_DELAY_MIN:-2.0}
+  GATEWAY_DELAY_MAX: ${GATEWAY_DELAY_MAX:-5.0}
+  GATEWAY_SUCCESS_RATE: ${GATEWAY_SUCCESS_RATE:-0.9}
+  CONSUMER_PREFETCH: ${CONSUMER_PREFETCH:-10}
+  MAX_ATTEMPTS: ${MAX_ATTEMPTS:-3}
+  RETRY_BASE_DELAY: ${RETRY_BASE_DELAY:-2.0}
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: payments
+      POSTGRES_PASSWORD: payments
+      POSTGRES_DB: payments
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U payments -d payments"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    ports:
+      - "5672:5672"
+      - "15672:15672"   # management UI: guest / guest
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  migrate:
+    build: .
+    command: alembic upgrade head
+    environment: *app-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    build: .
+    command: uvicorn payment_service.api.app:app --host 0.0.0.0 --port 8000
+    environment: *app-env
+    ports:
+      - "8000:8000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health').status==200 else 1)\""]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  consumer:
+    build: .
+    command: python -m payment_service.worker
+    environment: *app-env
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+
+  # Приёмник webhook'ов для демонстрации. Не часть сервиса, нужен только чтобы было куда слать.
+  webhook-sink:
+    build: .
+    command: uvicorn webhook_sink.app:app --host 0.0.0.0 --port 8080
+    environment:
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET:-dev-webhook-secret}
+    ports:
+      - "8080:8080"
+
+volumes:
+  pgdata:
